@@ -11,8 +11,7 @@ st.set_page_config(page_title="Multi-Node Congestion Dashboard", layout="wide")
 # --- SHARED CROSS-PC REAL-TIME STATE ---
 # This dictionary acts as our local simulated server memory.
 # It synchronizes data between the Sender PC, Admin PC, and Receiver PC.
-@st.cache_resource
-def get_shared_network_db():
+def build_default_network_db():
     return {
         "sender_raw_bytes": None,
         "shared_file_name": None,
@@ -26,8 +25,20 @@ def get_shared_network_db():
         "admin_service_rate": 4,
         "admin_loss": 1.0,
         "total_drops": 0,
-        "peak_cwnd": 0
+        "peak_cwnd": 0,
+        "final_dataframe": None
     }
+
+
+@st.cache_resource
+def get_shared_network_db():
+    return build_default_network_db()
+
+
+def reset_shared_network_db(shared_db):
+    shared_db.clear()
+    shared_db.update(build_default_network_db())
+
 
 db = get_shared_network_db()
 PROTOCOL_OPTIONS = [
@@ -47,7 +58,16 @@ user_role = query_params.get("role", "sender") # Defaults to sender
 st.sidebar.header("⚙️ Global Network Conditions")
 
 if user_role == "admin":
-    st.sidebar.success("👑 Admin Terminal Activated")
+    st.sidebar.success("Admin Terminal Activated")
+
+    if st.session_state.pop("admin_reset_notice", False):
+        st.sidebar.success("Cleared all queued payloads, receiver output, and telemetry results.")
+
+    if st.sidebar.button("Refresh / Clear All Sessions"):
+        reset_shared_network_db(db)
+        st.session_state.admin_protocol = db["active_protocol"]
+        st.session_state.admin_reset_notice = True
+        st.rerun()
 
     if "admin_protocol" not in st.session_state or st.session_state.admin_protocol not in PROTOCOL_OPTIONS:
         st.session_state.admin_protocol = db.get("active_protocol", PROTOCOL_OPTIONS[0])
@@ -244,7 +264,7 @@ elif user_role == "admin":
         st.subheader("📈 Multi-Node Transmission Telemetry")
         
         # Display the final static charts using stored memory dataframe
-        if "final_dataframe" in db:
+        if db.get("final_dataframe") is not None:
             df = db["final_dataframe"]
             if result_is_tcp:
                 st.markdown("#### Congestion Window ($CWND$) Evolution vs SSThresh")

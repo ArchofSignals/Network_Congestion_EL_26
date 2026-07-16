@@ -16,10 +16,10 @@ class TCPReno:
             self.state = "Congestion Avoidance"
 
     def on_loss(self):
-        """Apply TCP Reno fast recovery after loss detection."""
+        """Apply TCP Reno timeout behavior after loss detection."""
         self.ssthresh = max(2.0, self.cwnd / 2.0)
-        self.cwnd = self.ssthresh
-        self.state = "Fast Recovery"
+        self.cwnd = 1.0
+        self.state = "Slow Start"
 
 
 class UDPGenerator:
