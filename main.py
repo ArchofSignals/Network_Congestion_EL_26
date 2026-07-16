@@ -1,8 +1,8 @@
 import streamlit as st
 import time
 import io
-from network_engine import Router, NetworkLink, Packet
-from cc_algorithms import TCPReno
+from network_engine import Router, NetworkLink, Packet, transmit_tick
+from cc_algorithms import TCPReno, UDPGenerator
 from metrics_manager import MetricsManager
 
 # --- STREAMLIT PAGE LAYOUT ---
@@ -21,6 +21,7 @@ def get_shared_network_db():
         "simulation_triggered": False,
         "sim_completed": False,
         "active_protocol": "TCP (Reliable / Retransmissions)",
+        "last_run_protocol": "TCP (Reliable / Retransmissions)",
         "admin_buffer": 30,
         "admin_service_rate": 4,
         "admin_loss": 1.0,
@@ -29,6 +30,10 @@ def get_shared_network_db():
     }
 
 db = get_shared_network_db()
+PROTOCOL_OPTIONS = [
+    "TCP (Reliable / Retransmissions)",
+    "UDP (Unreliable / Drops Glitch Image)"
+]
 
 # --- ROLE DETECTION VIA URL QUERY ---
 # Access via:
@@ -43,6 +48,9 @@ st.sidebar.header("⚙️ Global Network Conditions")
 
 if user_role == "admin":
     st.sidebar.success("👑 Admin Terminal Activated")
+
+    if "admin_protocol" not in st.session_state or st.session_state.admin_protocol not in PROTOCOL_OPTIONS:
+        st.session_state.admin_protocol = db.get("active_protocol", PROTOCOL_OPTIONS[0])
     
     # Live sliders to tweak network performance
     db["admin_buffer"] = st.sidebar.slider("Router Buffer Capacity (Packets)", 5, 100, db["admin_buffer"])
@@ -51,8 +59,10 @@ if user_role == "admin":
     
     # Protocol Choice (TCP vs UDP)
     db["active_protocol"] = st.sidebar.radio(
-        "Select Transport Layer Protocol", 
-        ["TCP (Reliable / Retransmissions)", "UDP (Unreliable / Drops Glitch Image)"]
+        "Select Transport Layer Protocol",
+        PROTOCOL_OPTIONS,
+        index=PROTOCOL_OPTIONS.index(st.session_state.admin_protocol),
+        key="admin_protocol"
     )
 else:
     st.sidebar.warning("🔒 Controlled by Network Administrator")
@@ -109,13 +119,16 @@ elif user_role == "admin":
             router = Router(buffer_size=db["admin_buffer"])
             link = NetworkLink(loss_rate=db["admin_loss"] / 100.0)
             algo = TCPReno(init_cwnd=2.0, init_ssthresh=db["admin_buffer"] * 0.8)
+            udp = UDPGenerator(packets_per_tick=db["admin_service_rate"])
             metrics = MetricsManager()
+            metrics.clear()
             
             transmitted_successfully = {}
-            flight_queue = []
+            in_flight = {}
             tick = 0
             next_seq_to_send = 0
-            is_tcp = "TCP" in db["active_protocol"]
+            run_protocol = db["active_protocol"]
+            is_tcp = "TCP" in run_protocol
             
             # --- LIVE ANIMATION PLACEHOLDERS ---
             st.markdown("### ⚡ Live Network Telemetry Streaming...")
@@ -125,44 +138,40 @@ elif user_role == "admin":
             chart_placeholder2 = st.empty()
             
             # --- RUN SIMULATION PIPELINE ---
-            while next_seq_to_send < total_packets or len(flight_queue) > 0:
+            while len(transmitted_successfully) < total_packets:
                 tick += 1
-                tick_drops = 0
-                tick_successes = 0
+                outgoing_packets = []
                 
                 # Sender: Window Allocation
-                window_limit = int(algo.cwnd) if is_tcp else db["admin_service_rate"]
+                window_limit = max(1, int(algo.cwnd)) if is_tcp else udp.window_limit()
                 
-                while len(flight_queue) < window_limit and next_seq_to_send < total_packets:
+                while (len(in_flight) + len(outgoing_packets)) < window_limit and next_seq_to_send < total_packets:
                     pkt = Packet(next_seq_to_send, byte_chunks[next_seq_to_send], tick)
-                    flight_queue.append(pkt)
+                    outgoing_packets.append(pkt)
+                    if is_tcp:
+                        in_flight[pkt.sequence_number] = pkt
                     next_seq_to_send += 1
                 
-                # Router: Packet processing & drops
-                for pkt in list(flight_queue):
-                    if link.transmits_successfully():
-                        if router.arrive(pkt):
-                            flight_queue.remove(pkt)
-                        else:
-                            tick_drops += 1
-                            flight_queue.remove(pkt)
-                            if is_tcp:
-                                next_seq_to_send = min(next_seq_to_send, pkt.sequence_number)
-                            else:
-                                transmitted_successfully[pkt.sequence_number] = b'\x00' * len(pkt.data)
-                    else:
-                        tick_drops += 1
-                        flight_queue.remove(pkt)
-                        if is_tcp:
-                            next_seq_to_send = min(next_seq_to_send, pkt.sequence_number)
-                        else:
-                            transmitted_successfully[pkt.sequence_number] = b'\x00' * len(pkt.data)
-                
-                # Deliver packets
-                delivered = router.process_queue(service_rate=db["admin_service_rate"])
+                # Router and link: queue, service, wireless drop, and delivery
+                delivered, dropped = transmit_tick(
+                    router=router,
+                    link=link,
+                    outgoing_packets=outgoing_packets,
+                    service_rate=db["admin_service_rate"]
+                )
+                tick_drops = len(dropped)
                 tick_successes = len(delivered)
+                
                 for pkt in delivered:
                     transmitted_successfully[pkt.sequence_number] = pkt.data
+                    in_flight.pop(pkt.sequence_number, None)
+
+                for pkt in dropped:
+                    in_flight.pop(pkt.sequence_number, None)
+                    if is_tcp:
+                        next_seq_to_send = min(next_seq_to_send, pkt.sequence_number)
+                    else:
+                        transmitted_successfully[pkt.sequence_number] = b'\x00' * len(pkt.data)
                 
                 # Congestion Window Math adjustments
                 if is_tcp:
@@ -180,7 +189,7 @@ elif user_role == "admin":
                     queue_length=len(router.queue), 
                     drops=tick_drops, 
                     throughput=tick_successes, 
-                    state=algo.state if is_tcp else "UDP Streaming"
+                    state=algo.state if is_tcp else udp.state
                 )
                 
                 # --- UPDATE DASHBOARD REFRESH STREAM (EVERY TICK) ---
@@ -209,6 +218,7 @@ elif user_role == "admin":
                     reassembled_chunks.append(b'\x00' * len(byte_chunks[idx]))
                     
             db["received_bytes"] = b"".join(reassembled_chunks)
+            db["last_run_protocol"] = run_protocol
             db["simulation_triggered"] = False
             db["sim_completed"] = True
             db["total_drops"] = int(metrics.get_dataframe()["Packet Drops"].sum())
@@ -220,11 +230,13 @@ elif user_role == "admin":
             
     # Draw static snapshot metrics if simulation finished and stays passive
     if db["sim_completed"]:
+        result_protocol = db.get("last_run_protocol", db["active_protocol"])
+        result_is_tcp = "TCP" in result_protocol
         st.success("🎉 Simulation run complete! Telemetry captured below:")
         col1, col2, col3 = st.columns(3)
-        col1.metric("Selected Layer Mode", "TCP (Reliable)" if "TCP" in db["active_protocol"] else "UDP (Lossy)")
+        col1.metric("Selected Layer Mode", "TCP (Reliable)" if result_is_tcp else "UDP (Lossy)")
         col2.metric("Total Drops", f"{db['total_drops']} packets")
-        if "TCP" in db["active_protocol"]:
+        if result_is_tcp:
             col3.metric("Peak Congestion Window", f"{db['peak_cwnd']:.1f} packets")
         else:
             col3.metric("UDP Delivery Speed", "Maximum Link Rate")
@@ -234,7 +246,7 @@ elif user_role == "admin":
         # Display the final static charts using stored memory dataframe
         if "final_dataframe" in db:
             df = db["final_dataframe"]
-            if "TCP" in db["active_protocol"]:
+            if result_is_tcp:
                 st.markdown("#### Congestion Window ($CWND$) Evolution vs SSThresh")
                 st.line_chart(df, x="Tick", y=["CWND (Window Size)", "SSThresh"], color=["#FF4B4B", "#000000"])
             
@@ -259,7 +271,7 @@ elif user_role == "receiver":
         st.markdown("### 🖼️ Reassembled Output View")
         
         if "image" in file_type:
-            st.image(net_bytes, caption=f"Reassembled Image Output ({db['active_protocol']})", use_container_width=True)
+            st.image(net_bytes, caption=f"Reassembled Image Output ({db.get('last_run_protocol', db['active_protocol'])})", use_container_width=True)
         elif "text" in file_type:
             try:
                 st.text_area("Reassembled Text", value=net_bytes.decode("utf-8", errors="replace"), height=250)

@@ -1,6 +1,16 @@
 import pandas as pd
 
 class MetricsManager:
+    COLUMNS = [
+        "Tick",
+        "CWND (Window Size)",
+        "SSThresh",
+        "Router Queue Fill",
+        "Packet Drops",
+        "Throughput (Pkts/Tick)",
+        "CC State"
+    ]
+
     def __init__(self):
         self.history = []
 
@@ -16,7 +26,7 @@ class MetricsManager:
         })
 
     def get_dataframe(self):
-        return pd.DataFrame(self.history)
-        
+        return pd.DataFrame(self.history, columns=self.COLUMNS)
+
     def clear(self):
         self.history = []
